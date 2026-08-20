@@ -2,7 +2,7 @@
 
 A Tampermonkey userscript for the [Cursor Spending](https://cursor.com/dashboard/spending) page. It marks **pace** (how far usage should have gone if you burned the quota evenly over the billing window), restores high-precision percentages the UI rounds away, and surfaces dollar caps when the APIs expose them — or infers them when they do not.
 
-Repo: [github.com/xjoker/CursorSpendPace](https://github.com/xjoker/CursorSpendPace).
+Install: [Greasy Fork](https://greasyfork.org/zh-CN/scripts/592140-cursor-spend-pace). Source: [github.com/xjoker/CursorSpendPace](https://github.com/xjoker/CursorSpendPace).
 
 ## What it solves
 
@@ -17,12 +17,14 @@ The script runs in your logged-in `cursor.com` tab and reads the same origin API
 ## Install
 
 1. Install [Tampermonkey](https://www.tampermonkey.net/)
-2. Create a new script, paste [`cursor-spend-pace.user.js`](./cursor-spend-pace.user.js), save
+2. Open [Cursor Spend Pace on Greasy Fork](https://greasyfork.org/zh-CN/scripts/592140-cursor-spend-pace) and click Install
 3. Open <https://cursor.com/dashboard/spending> and refresh
+
+To install from this repo instead, create a new Tampermonkey script and paste [`cursor-spend-pace.user.js`](./cursor-spend-pace.user.js).
 
 `@match` is `https://cursor.com/dashboard/*`. Overlay rendering is limited to the Spending path.
 
-Version lives in the script header as `@version 20260820.6` (`YYYYMMDD.N`, reset `.N` each calendar day).
+Version lives in the script header as `@version 20260820.7` (`YYYYMMDD.N`, reset `.N` each calendar day).
 
 ## What you will see
 
@@ -76,6 +78,10 @@ Do not commit screenshots of your own Spending page (usage numbers and the accou
 - Missing fields degrade: high-precision percent and pace still render; quota text says omitted instead of breaking the page
 
 Cursor DOM or API changes can break the script until it is updated.
+
+## License
+
+MIT. The userscript header has `@license MIT` so Greasy Fork will display it; the full text is in [`LICENSE`](./LICENSE).
 
 ## Develop
 

@@ -1,9 +1,10 @@
 // ==UserScript==
 // @name         Cursor Spend Pace
 // @namespace    https://github.com/xjoker/CursorSpendPace
-// @version      20260820.6
+// @version      20260820.7
 // @description  Linear-burn pace, high-precision usage, and inferred caps on the Cursor Spending dashboard
 // @author       chou
+// @license      MIT
 // @match        https://cursor.com/dashboard/*
 // @run-at       document-idle
 // @grant        none
