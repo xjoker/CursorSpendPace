@@ -24,9 +24,11 @@ To install from this repo instead, create a new Tampermonkey script and paste [`
 
 `@match` is `https://cursor.com/dashboard/*`. Overlay rendering is limited to the Spending path.
 
-Version lives in the script header as `@version 20260820.7` (`YYYYMMDD.N`, reset `.N` each calendar day).
+Version lives in the script header as `@version 20260820.8` (`YYYYMMDD.N`, reset `.N` each calendar day).
 
 ## What you will see
+
+![Cursor Spend Pace overlay on Included in Ultra and Grok Bot](screenshot.png)
 
 On each relevant bar:
 
@@ -66,7 +68,7 @@ The same spend÷percent trick does **not** apply to Other Models: list-price eve
 - Fetches stay on `cursor.com` with your existing session cookie
 - Nothing is uploaded; the script does not write remote logs
 
-Do not commit screenshots of your own Spending page (usage numbers and the account sidebar).
+Do not commit screenshots that include the account sidebar. The cropped overlay shot in this README is the intended demo.
 
 ## Compatibility
 

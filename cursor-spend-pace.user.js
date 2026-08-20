@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cursor Spend Pace
 // @namespace    https://github.com/xjoker/CursorSpendPace
-// @version      20260820.7
+// @version      20260820.8
 // @description  Linear-burn pace, high-precision usage, and inferred caps on the Cursor Spending dashboard
 // @author       chou
 // @license      MIT
@@ -34,7 +34,10 @@
   let cachedGrok = null;
   let cachedTeamId = -1;
   let fetchTimer = 0;
+  let renderTimer = 0;
   let applying = false;
+  let observer = null;
+  const OBSERVE_OPTS = { childList: true, subtree: true };
 
   function onSpendingPage() {
     return location.pathname.startsWith("/dashboard/spending");
@@ -122,12 +125,10 @@
   }
 
   function ensureStyle() {
-    let style = document.getElementById(STYLE_ID);
-    if (!style) {
-      style = document.createElement("style");
-      style.id = STYLE_ID;
-      document.head.appendChild(style);
-    }
+    if (document.getElementById(STYLE_ID)) return;
+    const style = document.createElement("style");
+    style.id = STYLE_ID;
+    document.head.appendChild(style);
     style.textContent = `
       .${WRAP_CLASS} { position: relative; }
       .${WRAP_CLASS} .${MARKER_CLASS} {
@@ -531,7 +532,15 @@
     const usedSpan = findUsedSpan(track);
     if (usedSpan) usedSpan.textContent = `${formatPct(used)} used`;
 
-    wrap.querySelector(`:scope > .${META_CLASS}`)?.remove();
+    const sig = [
+      used.toFixed(6),
+      shownPace == null ? "" : shownPace.toFixed(4),
+      over ? "1" : "0",
+      quotaLine || "",
+    ].join("|");
+    if (wrap.dataset.csSig === sig) return;
+    wrap.dataset.csSig = sig;
+
     wrap.querySelector(":scope > .cs-pace-overshoot")?.remove();
     track.querySelector(".cs-pace-overshoot")?.remove();
     track.querySelector(`.${MARKER_CLASS}`)?.remove();
@@ -579,9 +588,36 @@
     return { startMs, endMs, windowMs: endMs - startMs };
   }
 
+  function overlayNode(node) {
+    if (!node) return false;
+    if (node.nodeType === 3) return overlayNode(node.parentElement);
+    if (node.nodeType !== 1) return false;
+    return Boolean(node.id === STYLE_ID || node.closest?.(`.${WRAP_CLASS}, .${META_CLASS}`));
+  }
+
+  function onlyOverlayMutations(mutations) {
+    return mutations.every((m) => {
+      if (!overlayNode(m.target)) return false;
+      for (const node of m.addedNodes) {
+        if (node.nodeType === 1 && !overlayNode(node)) return false;
+      }
+      for (const node of m.removedNodes) {
+        if (node.nodeType === 1 && !overlayNode(node)) return false;
+      }
+      return true;
+    });
+  }
+
+  function requestRender() {
+    if (applying) return;
+    window.clearTimeout(renderTimer);
+    renderTimer = window.setTimeout(render, 50);
+  }
+
   function render() {
     if (!onSpendingPage() || applying) return;
     applying = true;
+    observer?.disconnect();
     try {
       ensureStyle();
       const now = Date.now();
@@ -618,6 +654,8 @@
         });
       }
     } finally {
+      observer?.takeRecords();
+      observer?.observe(document.documentElement, OBSERVE_OPTS);
       applying = false;
     }
   }
@@ -690,13 +728,14 @@
     }, 80);
   }
 
-  const observer = new MutationObserver(() => {
-    if (!onSpendingPage()) return;
-    if (cachedSummary || cachedGrok || cachedPeriod) render();
+  observer = new MutationObserver((mutations) => {
+    if (!onSpendingPage() || applying) return;
+    if (onlyOverlayMutations(mutations)) return;
+    if (cachedSummary || cachedGrok || cachedPeriod) requestRender();
     else schedule();
   });
 
-  observer.observe(document.documentElement, { childList: true, subtree: true });
+  observer.observe(document.documentElement, OBSERVE_OPTS);
   window.addEventListener("popstate", schedule);
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible") refresh();
