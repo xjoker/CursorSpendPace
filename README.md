@@ -24,7 +24,7 @@ To install from this repo instead, create a new Tampermonkey script and paste [`
 
 `@match` covers `cursor.com/dashboard` and its subpaths (including locale prefixes like `/cn/dashboard`). Overlay rendering is limited to the Spending and Usage paths. The dashboard is a client-side app: the script hooks `pushState` / `replaceState` so switching tabs injects without a full reload.
 
-Version lives in the script header as `@version 20260826.7` (`YYYYMMDD.N`, reset `.N` each calendar day).
+Version lives in the script header as `@version 20260826.8` (`YYYYMMDD.N`, reset `.N` each calendar day).
 
 ## What you will see
 
@@ -76,7 +76,8 @@ Do not commit screenshots that include the account sidebar. The cropped overlay 
 - Dates: ISO strings or epoch milliseconds
 - Personal accounts send `teamId: -1`, same as the dashboard client; a real team id is used when the orgs/teams APIs return one
 - Aggregated-usage requests retry two alternate bodies if the first fails
-- Bars are identified by heading text, not by index
+- Included bars attach to any `included-in-*` heading (Pro / Pro+ / Ultra / Teams), not only `#included-in-ultra`; pool type still follows the Cursor Models / Other Models card title
+- Missing billing dates say `billing window missing` instead of pretending the quota is exhausted
 - Missing fields degrade: high-precision percent and pace still render; quota text says omitted instead of breaking the page
 
 Cursor DOM or API changes can break the script until it is updated.

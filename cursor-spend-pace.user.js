@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cursor Spend Pace
 // @namespace    https://github.com/xjoker/CursorSpendPace
-// @version      20260826.7
+// @version      20260826.8
 // @description  Linear-burn pace, high-precision usage, and inferred caps on the Cursor Spending dashboard
 // @author       chou
 // @license      MIT
@@ -67,14 +67,14 @@
     const tab = new URLSearchParams(location.search).get("tab");
     if (path === "/dashboard" && /^(spending|usage)$/i.test(tab || "")) return true;
     return Boolean(
-      document.getElementById("included-in-ultra") || document.getElementById("grok-bot"),
+      document.querySelector("[id^='included-in-']") ||
+        document.getElementById("grok-bot") ||
+        includedSectionRoots().length > 0,
     );
   }
 
   function overlayHasTracks() {
-    return (
-      sectionTracks("included-in-ultra").length > 0 || sectionTracks("grok-bot").length > 0
-    );
+    return poolTracks().length > 0 || sectionTracks("grok-bot").length > 0;
   }
 
   function clamp(n, lo, hi) {
@@ -113,10 +113,8 @@
     return clamp((elapsedMs / windowMs) * 100, 0, 100);
   }
 
-  function visiblePace(used, pace) {
-    const remaining = Math.max(100 - used, 0);
-    if (Math.round(remaining) <= 0) return null;
-    return pace;
+  function quotaGone(used) {
+    return Math.round(Math.max(100 - used, 0)) <= 0;
   }
 
   function isOver(used, pace) {
@@ -337,18 +335,58 @@
     throw lastErr || new Error("aggregated usage unavailable");
   }
 
-  function sectionRoot(sectionId) {
-    const header = document.getElementById(sectionId);
-    if (!header) return null;
-    return header.closest(".dashboard-section") || header.closest("section") || header.parentElement;
+  function sectionRoot(el) {
+    if (!el) return null;
+    return el.closest(".dashboard-section") || el.closest("section") || el.parentElement;
   }
 
-  function sectionTracks(sectionId) {
-    const section = sectionRoot(sectionId);
+  function tracksIn(section) {
     if (!section) return [];
     const primary = [...section.querySelectorAll(".relative.w-full.overflow-hidden.rounded-full")];
     if (primary.length) return primary;
     return [...section.querySelectorAll('[class*="rounded-full"]')].filter((el) => findFill(el));
+  }
+
+  function sectionTracks(sectionId) {
+    return tracksIn(sectionRoot(document.getElementById(sectionId)));
+  }
+
+  function uniqueNodes(nodes) {
+    const seen = new Set();
+    return nodes.filter((el) => {
+      if (!el || seen.has(el)) return false;
+      seen.add(el);
+      return true;
+    });
+  }
+
+  function includedSectionRoots() {
+    const roots = [];
+    const seen = new Set();
+    const add = (el) => {
+      const root = sectionRoot(el);
+      if (!root || seen.has(root)) return;
+      seen.add(root);
+      roots.push(root);
+    };
+    document.querySelectorAll("[id]").forEach((el) => {
+      if (/^included-in-/i.test(el.id)) add(el);
+    });
+    document.querySelectorAll("h1,h2,h3,h4,button").forEach((el) => {
+      if (/^included in /i.test((el.textContent || "").trim())) add(el);
+    });
+    return roots;
+  }
+
+  function poolTracks() {
+    const fromRoots = uniqueNodes(includedSectionRoots().flatMap(tracksIn));
+    if (fromRoots.length) return fromRoots;
+    return uniqueNodes([
+      ...document.querySelectorAll(".relative.w-full.overflow-hidden.rounded-full"),
+    ]).filter((track) => {
+      const kind = trackKind(track);
+      return kind === "cursor" || kind === "other";
+    });
   }
 
   function findFill(track) {
@@ -670,7 +708,9 @@
   function applyTrack(track, used, pace, windowMs, quota) {
     const fill = findFill(track);
     if (!fill) return;
-    const shownPace = visiblePace(used, pace);
+    const exhausted = quotaGone(used);
+    const windowOk = pace != null && Number.isFinite(windowMs) && windowMs > 0;
+    const shownPace = exhausted || !windowOk ? null : pace;
     const over = isOver(used, shownPace);
     const color = usedColor(used, over);
     const wrap = wrapTrack(track);
@@ -688,6 +728,7 @@
       used.toFixed(6),
       shownPace == null ? "" : shownPace.toFixed(4),
       over ? "1" : "0",
+      exhausted ? "ex" : windowOk ? "ok" : "nowin",
       quotaLine,
       note,
       tops.map((t) => `${t.name}:${t.cents}`).join(","),
@@ -716,9 +757,10 @@
     }
 
     const meta = upsertAfter(wrap, META_CLASS);
-    const status =
-      shownPace == null
-        ? "<span>quota exhausted, hiding pace</span>"
+    const status = exhausted
+      ? "<span>quota exhausted, hiding pace</span>"
+      : !windowOk
+        ? "<span>billing window missing, hiding pace</span>"
         : over
           ? `<span class="cs-pace-rest" style="color:${color}">rest ${formatRest(restMs(used, shownPace, windowMs))} to even pace</span>`
           : `<span style="color:${C_GREEN}">under pace · ${formatPct(Math.max(shownPace - used, 0), 2)} left</span>`;
@@ -779,7 +821,7 @@
         const pace = pacePercent(startMs, endMs, now);
         const cursorLine = cursorModelsQuotaLine(cachedPeriod, cachedAgg);
         const otherLine = otherModelsQuotaLine(cachedPeriod, cachedSummary, cachedAgg);
-        sectionTracks("included-in-ultra").forEach((track, index) => {
+        poolTracks().forEach((track, index) => {
           const kind = trackKind(track, index);
           const used = poolUsed(kind, cachedSummary, cachedPeriod, findFill(track));
           const quota = kind === "other" ? otherLine : cursorLine;
