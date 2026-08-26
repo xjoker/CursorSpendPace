@@ -1,12 +1,17 @@
 // ==UserScript==
 // @name         Cursor Spend Pace
 // @namespace    https://github.com/xjoker/CursorSpendPace
-// @version      20260820.8
+// @version      20260826.7
 // @description  Linear-burn pace, high-precision usage, and inferred caps on the Cursor Spending dashboard
 // @author       chou
 // @license      MIT
+// @match        https://cursor.com/dashboard
 // @match        https://cursor.com/dashboard/*
-// @run-at       document-idle
+// @match        https://www.cursor.com/dashboard
+// @match        https://www.cursor.com/dashboard/*
+// @match        https://cursor.com/*/dashboard
+// @match        https://cursor.com/*/dashboard/*
+// @run-at       document-start
 // @grant        none
 // ==/UserScript==
 
@@ -28,19 +33,48 @@
 
   let cachedSummary = null;
   let cachedPeriod = null;
-  let cachedPlanInfo = null;
   let cachedAgg = null;
   let cachedGrokAgg = null;
   let cachedGrok = null;
   let cachedTeamId = -1;
   let fetchTimer = 0;
   let renderTimer = 0;
+  let waitTimer = 0;
+  let waitUntil = 0;
   let applying = false;
+  let pendingRender = false;
   let observer = null;
+  let lastHref = "";
   const OBSERVE_OPTS = { childList: true, subtree: true };
 
-  function onSpendingPage() {
-    return location.pathname.startsWith("/dashboard/spending");
+  function dashboardPath() {
+    return (location.pathname.replace(/\/+$/, "") || "/").replace(
+      /^\/[a-z]{2}(?:-[A-Za-z]{2})?(?=\/|$)/,
+      "",
+    );
+  }
+
+  function onOverlayPage() {
+    const path = dashboardPath();
+    if (
+      path === "/dashboard/spending" ||
+      path === "/dashboard/usage" ||
+      path.startsWith("/dashboard/spending/") ||
+      path.startsWith("/dashboard/usage/")
+    ) {
+      return true;
+    }
+    const tab = new URLSearchParams(location.search).get("tab");
+    if (path === "/dashboard" && /^(spending|usage)$/i.test(tab || "")) return true;
+    return Boolean(
+      document.getElementById("included-in-ultra") || document.getElementById("grok-bot"),
+    );
+  }
+
+  function overlayHasTracks() {
+    return (
+      sectionTracks("included-in-ultra").length > 0 || sectionTracks("grok-bot").length > 0
+    );
   }
 
   function clamp(n, lo, hi) {
@@ -125,16 +159,18 @@
   }
 
   function ensureStyle() {
-    if (document.getElementById(STYLE_ID)) return;
-    const style = document.createElement("style");
-    style.id = STYLE_ID;
-    document.head.appendChild(style);
+    let style = document.getElementById(STYLE_ID);
+    if (!style) {
+      style = document.createElement("style");
+      style.id = STYLE_ID;
+      (document.head || document.documentElement).appendChild(style);
+    }
     style.textContent = `
-      .${WRAP_CLASS} { position: relative; }
+      .${WRAP_CLASS} { position: relative; overflow: visible; }
       .${WRAP_CLASS} .${MARKER_CLASS} {
         position: absolute;
-        top: -5px;
-        height: calc(100% + 10px);
+        top: -4px;
+        height: calc(100% + 4px);
         width: 2px;
         margin-left: -1px;
         background: ${C_MARK};
@@ -145,7 +181,7 @@
       }
       .${WRAP_CLASS} .${LABEL_CLASS} {
         position: absolute;
-        top: calc(100% + 3px);
+        top: calc(100% + 8px);
         z-index: 3;
         pointer-events: none;
         font: 11px/1.2 ui-sans-serif, system-ui, sans-serif;
@@ -154,16 +190,67 @@
         white-space: nowrap;
         letter-spacing: .01em;
       }
+      .${WRAP_CLASS} .${LABEL_CLASS} .cs-pace-arrow {
+        position: absolute;
+        left: 0;
+        top: 0;
+        width: 12px;
+        margin-left: -6px;
+        text-align: center;
+        line-height: 1;
+      }
+      .${WRAP_CLASS} .${LABEL_CLASS} .cs-pace-copy { display: inline-block; }
+      .${WRAP_CLASS} .${LABEL_CLASS}[data-side="right"] .cs-pace-copy { margin-left: 10px; }
+      .${WRAP_CLASS} .${LABEL_CLASS}[data-side="left"] .cs-pace-copy {
+        transform: translateX(calc(-100% - 10px));
+      }
       .${META_CLASS} {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        margin-top: 26px;
+        font: 11px/1.35 ui-sans-serif, system-ui, sans-serif;
+        color: ${DIM};
+      }
+      .${META_CLASS} .cs-pace-meta-row {
         display: flex;
         align-items: baseline;
         justify-content: space-between;
         gap: 12px;
-        margin-top: 16px;
-        font: 11px/1.35 ui-sans-serif, system-ui, sans-serif;
-        color: ${DIM};
       }
-      .${META_CLASS} > span:first-child { min-width: 0; }
+      .${META_CLASS} .cs-pace-meta-row > span:first-child { min-width: 0; }
+      .${META_CLASS} .cs-pace-note {
+        font-size: 10px;
+        line-height: 1.35;
+        color: #94a3b8;
+      }
+      .${META_CLASS} .cs-pace-tops {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+      }
+      .${META_CLASS} .cs-pace-top {
+        display: inline-flex;
+        align-items: baseline;
+        gap: 5px;
+        max-width: 100%;
+        padding: 2px 8px;
+        border-radius: 999px;
+        background: #f1f5f9;
+        color: #334155;
+        font-variant-numeric: tabular-nums;
+      }
+      .${META_CLASS} .cs-pace-top b {
+        font-weight: 700;
+        color: #64748b;
+        font-size: 10px;
+      }
+      .${META_CLASS} .cs-pace-top i {
+        font-style: normal;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
       .cs-pace-rest { font-weight: 700; }
     `;
   }
@@ -192,10 +279,6 @@
 
   async function loadPeriod() {
     return postJson("/api/dashboard/get-current-period-usage", {});
-  }
-
-  async function loadPlanInfo() {
-    return postJson("/api/dashboard/get-plan-info", {});
   }
 
   function walkTeamId(value, depth = 0) {
@@ -343,20 +426,40 @@
     return String(name || "").replace(/^cursor-/, "");
   }
 
-  function topSpender(agg, predicate) {
-    let best = null;
+  function topSpenders(agg, predicate, limit = 3) {
+    const rows = [];
     for (const row of agg?.aggregations || []) {
       const name = rowName(row);
       if (!predicate(name)) continue;
       const cents = rowCents(row);
-      if (!best || cents > best.cents) best = { name, cents };
+      if (!(cents > 0)) continue;
+      rows.push({ name, cents });
     }
-    return best;
+    rows.sort((a, b) => b.cents - a.cents);
+    return rows.slice(0, limit);
   }
 
-  function withTopModel(line, top) {
-    if (!top || !(top.cents > 0)) return line;
-    return `${line} · top ${shortModelName(top.name)} ${formatUsdFromCents(top.cents)}`;
+  function escapeText(value) {
+    return String(value)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+
+  function topsMarkup(tops) {
+    if (!tops?.length) return "";
+    const chips = tops
+      .map(
+        (top, i) =>
+          `<span class="cs-pace-top"><b>#${i + 1}</b><i>${escapeText(shortModelName(top.name))}</i>${formatUsdFromCents(top.cents)}</span>`,
+      )
+      .join("");
+    return `<div class="cs-pace-tops">${chips}</div>`;
+  }
+
+  function quotaInfo(line, tops, note) {
+    return { line, tops: tops || [], note: note || "" };
   }
 
   function sumMatchingCents(agg, predicate) {
@@ -377,68 +480,80 @@
     return Math.round(rawCents);
   }
 
-  function inferredCapLine(usedCents, pct, label) {
+  function inferCap(usedCents, pct, label) {
     if (!(Number.isFinite(pct) && pct > 0 && usedCents > 0)) return null;
-    const cap = inferRoundCapCents(usedCents / (pct / 100));
+    const raw = usedCents / (pct / 100);
+    const cap = inferRoundCapCents(raw);
     if (cap == null) return null;
-    return `${formatUsdFromCents(usedCents)} / ${formatUsdFromCents(cap)} inferred ${label}`;
+    return {
+      line: `${formatUsdFromCents(usedCents)} / ${formatUsdFromCents(cap)} inferred ${label}`,
+      note: `list ${formatUsdFromCents(usedCents)} ÷ ${formatPct(pct, 3)} = ${formatUsdFromCents(raw)} this snapshot`,
+    };
   }
 
   function cursorModelsQuotaLine(period, agg) {
     const autoSet = autoModelSet(period);
-    const top = topSpender(agg, (name) => isCursorPoolModel(name, autoSet));
+    const tops = topSpenders(agg, (name) => isCursorPoolModel(name, autoSet));
     const usage = period?.planUsage || {};
     const pct = pickNumber(usage, ["autoPercentUsed", "auto_percent_used"]);
     const protoLimit = pickNumber(usage, ["autoLimit", "auto_limit"], true);
     const protoSpend = pickNumber(usage, ["autoSpend", "auto_spend"]);
     let line = "Cursor Models cap omitted by API";
+    let note = "";
     if (protoLimit != null) {
       const used = pct != null ? (protoLimit * pct) / 100 : protoSpend;
       line = `${formatUsdFromCents(used)} / ${formatUsdFromCents(protoLimit)} Cursor Models`;
     } else {
       const usedCents = sumMatchingCents(agg, (name) => isCursorPoolModel(name, autoSet));
-      line = inferredCapLine(usedCents, pct, "Cursor Models cap") || line;
+      const inferred = inferCap(usedCents, pct, "Cursor Models cap");
+      if (inferred) {
+        line = inferred.line;
+        note = inferred.note;
+      }
     }
-    return withTopModel(line, top);
+    return quotaInfo(line, tops, note);
   }
 
-  function otherModelsCapCents(period, summary, planInfo) {
-    const usage = period?.planUsage || {};
-    const plan = summary?.individualUsage?.plan;
-    const info = planInfo?.planInfo || planInfo;
-    return (
-      pickNumber(usage, ["apiLimit", "api_limit"], true) ??
-      pickNumber(info, ["includedAmountCents", "included_amount_cents"], true) ??
-      pickNumber(plan, ["limit"], true)
-    );
-  }
-
-  function otherModelsQuotaLine(period, summary, planInfo, agg) {
+  function otherModelsQuotaLine(period, summary, agg) {
     const autoSet = autoModelSet(period);
-    const top = topSpender(agg, (name) => isOtherPoolModel(name, autoSet));
-    const cap = otherModelsCapCents(period, summary, planInfo);
+    const tops = topSpenders(agg, (name) => isOtherPoolModel(name, autoSet));
+    const usage = period?.planUsage || {};
     const pct =
-      pickNumber(period?.planUsage, ["apiPercentUsed", "api_percent_used"]) ??
+      pickNumber(usage, ["apiPercentUsed", "api_percent_used"]) ??
       pickNumber(summary?.individualUsage?.plan, ["apiPercentUsed", "api_percent_used"]);
+    const protoLimit = pickNumber(usage, ["apiLimit", "api_limit"], true);
+    const protoSpend = pickNumber(usage, ["apiSpend", "api_spend"]);
     let line = "Other Models cap omitted by API";
-    if (cap != null && pct != null) {
-      line = `${formatUsdFromCents((cap * pct) / 100)} / ${formatUsdFromCents(cap)} Other Models included`;
-    } else if (cap != null) {
-      line = `${formatUsdFromCents(cap)} Other Models included`;
+    let note = "";
+    if (protoLimit != null) {
+      const used = pct != null ? (protoLimit * pct) / 100 : protoSpend;
+      line = `${formatUsdFromCents(used)} / ${formatUsdFromCents(protoLimit)} Other Models`;
+    } else {
+      const usedCents = sumMatchingCents(agg, (name) => isOtherPoolModel(name, autoSet));
+      const inferred = inferCap(usedCents, pct, "Other Models cap");
+      if (inferred) {
+        line = inferred.line;
+        note = inferred.note;
+      }
     }
-    return withTopModel(line, top);
+    return quotaInfo(line, tops, note);
   }
 
   function grokQuotaLine(grok, grokAgg) {
-    const top = topSpender(grokAgg, isSandModel);
+    const tops = topSpenders(grokAgg, isSandModel);
     const pct = pickNumber(grok, ["usagePercent", "usage_percent"]);
     const usedCents = sumMatchingCents(grokAgg, isSandModel);
     let line =
       grok?.hasNonZeroIncludedLimit || grok?.has_non_zero_included_limit
         ? "Grok included limit exists, cap omitted by API"
         : "Grok weekly cap omitted by API";
-    line = inferredCapLine(usedCents, pct, "Grok weekly cap") || line;
-    return withTopModel(line, top);
+    let note = "";
+    const inferred = inferCap(usedCents, pct, "Grok weekly cap");
+    if (inferred) {
+      line = inferred.line;
+      note = inferred.note;
+    }
+    return quotaInfo(line, tops, note);
   }
 
   function parseUsedFromFill(fill) {
@@ -484,11 +599,45 @@
     return wrap;
   }
 
-  function placeHoriz(el, percent) {
-    el.style.left = `${percent}%`;
-    if (percent < 10) el.style.transform = "translateX(0)";
-    else if (percent > 90) el.style.transform = "translateX(-100%)";
-    else el.style.transform = "translateX(-50%)";
+  function placeMarker(marker, percent) {
+    marker.style.left = `${percent}%`;
+    marker.style.transform = "none";
+    marker.style.marginLeft = "-1px";
+  }
+
+  function layoutPaceLabel(label, percent) {
+    let arrow = label.querySelector(".cs-pace-arrow");
+    let copy = label.querySelector(".cs-pace-copy");
+    if (!arrow || !copy) {
+      label.textContent = "";
+      arrow = document.createElement("span");
+      arrow.className = "cs-pace-arrow";
+      arrow.textContent = "↑";
+      copy = document.createElement("span");
+      copy.className = "cs-pace-copy";
+      label.append(arrow, copy);
+    }
+    copy.textContent = `pace ${formatPct(percent, 2)}`;
+    label.style.left = `${percent}%`;
+    label.dataset.side = "right";
+    const wrap = label.parentElement;
+    if (!wrap) return;
+    const wrapW = wrap.getBoundingClientRect().width;
+    const copyW = copy.getBoundingClientRect().width;
+    if (!(wrapW > 0 && copyW > 0)) return;
+    const x = (percent / 100) * wrapW;
+    if (x + 10 + copyW > wrapW - 2) label.dataset.side = "left";
+  }
+
+  function watchWrap(wrap) {
+    if (wrap.dataset.csRo) return;
+    wrap.dataset.csRo = "1";
+    const ro = new ResizeObserver(() => {
+      const label = wrap.querySelector(`:scope > .${LABEL_CLASS}`);
+      const pct = Number(wrap.dataset.csPace);
+      if (label && Number.isFinite(pct)) layoutPaceLabel(label, pct);
+    });
+    ro.observe(wrap);
   }
 
   function findUsedSpan(track) {
@@ -518,7 +667,7 @@
     return el;
   }
 
-  function applyTrack(track, used, pace, windowMs, quotaLine) {
+  function applyTrack(track, used, pace, windowMs, quota) {
     const fill = findFill(track);
     if (!fill) return;
     const shownPace = visiblePace(used, pace);
@@ -532,11 +681,16 @@
     const usedSpan = findUsedSpan(track);
     if (usedSpan) usedSpan.textContent = `${formatPct(used)} used`;
 
+    const quotaLine = quota?.line || "cap not in API";
+    const tops = quota?.tops || [];
+    const note = quota?.note || "";
     const sig = [
       used.toFixed(6),
       shownPace == null ? "" : shownPace.toFixed(4),
       over ? "1" : "0",
-      quotaLine || "",
+      quotaLine,
+      note,
+      tops.map((t) => `${t.name}:${t.cents}`).join(","),
     ].join("|");
     if (wrap.dataset.csSig === sig) return;
     wrap.dataset.csSig = sig;
@@ -553,32 +707,25 @@
     } else {
       marker = upsertChild(wrap, MARKER_CLASS);
       marker.title = "Linear burn: usage should be here by now";
-      placeHoriz(marker, shownPace);
-      marker.style.transform = "none";
-      marker.style.marginLeft = "-1px";
+      placeMarker(marker, shownPace);
 
       label = upsertChild(wrap, LABEL_CLASS);
-      label.textContent = `↑ pace ${formatPct(shownPace, 2)}`;
-      placeHoriz(label, shownPace);
+      wrap.dataset.csPace = String(shownPace);
+      watchWrap(wrap);
+      layoutPaceLabel(label, shownPace);
     }
 
     const meta = upsertAfter(wrap, META_CLASS);
-    const quota = quotaLine || "cap not in API";
-    if (shownPace == null) {
-      meta.innerHTML = `<span>${quota}</span><span>quota exhausted, hiding pace</span>`;
-      return;
-    }
-    if (over) {
-      const wait = formatRest(restMs(used, shownPace, windowMs));
-      meta.innerHTML =
-        `<span>${quota}</span>` +
-        `<span class="cs-pace-rest" style="color:${color}">rest ${wait} to even pace</span>`;
-    } else {
-      const slack = Math.max(shownPace - used, 0);
-      meta.innerHTML =
-        `<span>${quota}</span>` +
-        `<span style="color:${C_GREEN}">under pace · ${formatPct(slack, 2)} left</span>`;
-    }
+    const status =
+      shownPace == null
+        ? "<span>quota exhausted, hiding pace</span>"
+        : over
+          ? `<span class="cs-pace-rest" style="color:${color}">rest ${formatRest(restMs(used, shownPace, windowMs))} to even pace</span>`
+          : `<span style="color:${C_GREEN}">under pace · ${formatPct(Math.max(shownPace - used, 0), 2)} left</span>`;
+    meta.innerHTML =
+      `<div class="cs-pace-meta-row"><span>${escapeText(quotaLine)}</span>${status}</div>` +
+      (note ? `<div class="cs-pace-note">${escapeText(note)}</div>` : "") +
+      topsMarkup(tops);
   }
 
   function cycleWindow(summary, period) {
@@ -609,15 +756,20 @@
   }
 
   function requestRender() {
-    if (applying) return;
+    if (applying) {
+      pendingRender = true;
+      return;
+    }
     window.clearTimeout(renderTimer);
     renderTimer = window.setTimeout(render, 50);
   }
 
   function render() {
-    if (!onSpendingPage() || applying) return;
+    if (!onOverlayPage() || applying) {
+      if (onOverlayPage() && applying) pendingRender = true;
+      return;
+    }
     applying = true;
-    observer?.disconnect();
     try {
       ensureStyle();
       const now = Date.now();
@@ -626,12 +778,7 @@
         const { startMs, endMs, windowMs } = cycleWindow(cachedSummary, cachedPeriod);
         const pace = pacePercent(startMs, endMs, now);
         const cursorLine = cursorModelsQuotaLine(cachedPeriod, cachedAgg);
-        const otherLine = otherModelsQuotaLine(
-          cachedPeriod,
-          cachedSummary,
-          cachedPlanInfo,
-          cachedAgg,
-        );
+        const otherLine = otherModelsQuotaLine(cachedPeriod, cachedSummary, cachedAgg);
         sectionTracks("included-in-ultra").forEach((track, index) => {
           const kind = trackKind(track, index);
           const used = poolUsed(kind, cachedSummary, cachedPeriod, findFill(track));
@@ -654,9 +801,13 @@
         });
       }
     } finally {
-      observer?.takeRecords();
-      observer?.observe(document.documentElement, OBSERVE_OPTS);
       applying = false;
+      if (pendingRender) {
+        pendingRender = false;
+        requestRender();
+      } else if (onOverlayPage() && !overlayHasTracks()) {
+        startWaitForBars();
+      }
     }
   }
 
@@ -665,7 +816,7 @@
   }
 
   async function refresh() {
-    if (!onSpendingPage()) return;
+    if (!onOverlayPage()) return;
     const tasks = [
       loadSummary()
         .then((data) => {
@@ -677,11 +828,6 @@
           cachedPeriod = data;
         })
         .catch((err) => swallow("period-usage", err)),
-      loadPlanInfo()
-        .then((data) => {
-          cachedPlanInfo = data;
-        })
-        .catch((err) => swallow("plan-info", err)),
       loadGrok()
         .then((data) => {
           cachedGrok = data;
@@ -728,21 +874,112 @@
     }, 80);
   }
 
+  function startWaitForBars() {
+    const now = Date.now();
+    if (!waitUntil || now >= waitUntil) waitUntil = now + 12_000;
+    if (waitTimer) return;
+    tickWait();
+  }
+
+  function tickWait() {
+    waitTimer = 0;
+    if (!onOverlayPage()) {
+      if (Date.now() < waitUntil) waitTimer = window.setTimeout(tickWait, 250);
+      return;
+    }
+    if (overlayHasTracks()) {
+      if (cachedSummary || cachedPeriod || cachedGrok) requestRender();
+      else schedule();
+      return;
+    }
+    if (Date.now() >= waitUntil) return;
+    if (cachedSummary || cachedPeriod || cachedGrok) requestRender();
+    else schedule();
+    waitTimer = window.setTimeout(tickWait, 250);
+  }
+
+  function onUrlChange(force = false) {
+    if (!force && location.href === lastHref) return;
+    lastHref = location.href;
+    if (onOverlayPage()) {
+      schedule();
+      startWaitForBars();
+    }
+  }
+
+  function hookHistoryMethod(method) {
+    const orig = history[method];
+    if (typeof orig !== "function" || orig.__csPace) return;
+    const wrapped = function (...args) {
+      const ret = orig.apply(this, args);
+      onUrlChange();
+      return ret;
+    };
+    wrapped.__csPace = true;
+    history[method] = wrapped;
+  }
+
+  function hookSpaNavigation() {
+    hookHistoryMethod("pushState");
+    hookHistoryMethod("replaceState");
+    window.addEventListener("popstate", () => onUrlChange());
+    window.addEventListener("hashchange", () => onUrlChange());
+    if (window.navigation?.addEventListener) {
+      window.navigation.addEventListener("navigate", () => {
+        queueMicrotask(() => onUrlChange());
+      });
+    }
+    document.addEventListener(
+      "click",
+      (ev) => {
+        const el = ev.target?.closest?.("a,button,[role='tab'],[role='link']");
+        if (!el) return;
+        const blob = `${el.getAttribute("href") || ""} ${el.getAttribute("aria-label") || ""} ${el.textContent || ""}`;
+        if (!/spending|usage/i.test(blob)) return;
+        window.setTimeout(() => onUrlChange(true), 0);
+        window.setTimeout(() => onUrlChange(true), 300);
+      },
+      true,
+    );
+    window.setInterval(() => {
+      hookHistoryMethod("pushState");
+      hookHistoryMethod("replaceState");
+    }, 1000);
+  }
+
   observer = new MutationObserver((mutations) => {
-    if (!onSpendingPage() || applying) return;
+    onUrlChange();
+    if (!onOverlayPage()) return;
     if (onlyOverlayMutations(mutations)) return;
+    if (applying) {
+      pendingRender = true;
+      startWaitForBars();
+      return;
+    }
     if (cachedSummary || cachedGrok || cachedPeriod) requestRender();
     else schedule();
+    if (!overlayHasTracks()) startWaitForBars();
   });
 
-  observer.observe(document.documentElement, OBSERVE_OPTS);
-  window.addEventListener("popstate", schedule);
+  hookSpaNavigation();
+  if (document.documentElement) {
+    observer.observe(document.documentElement, OBSERVE_OPTS);
+  } else {
+    document.addEventListener("DOMContentLoaded", () => {
+      observer.observe(document.documentElement, OBSERVE_OPTS);
+    });
+  }
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible") refresh();
+    if (document.visibilityState === "visible" && onOverlayPage()) refresh();
   });
   window.setInterval(() => {
-    if (onSpendingPage() && document.visibilityState === "visible") refresh();
+    onUrlChange();
+    if (onOverlayPage() && document.visibilityState === "visible") refresh();
   }, 60_000);
+  window.setInterval(() => onUrlChange(), 400);
 
-  refresh();
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", () => onUrlChange(true));
+  }
+  onUrlChange(true);
 })();

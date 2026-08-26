@@ -22,9 +22,9 @@ The script runs in your logged-in `cursor.com` tab and reads the same origin API
 
 To install from this repo instead, create a new Tampermonkey script and paste [`cursor-spend-pace.user.js`](./cursor-spend-pace.user.js).
 
-`@match` is `https://cursor.com/dashboard/*`. Overlay rendering is limited to the Spending path.
+`@match` covers `cursor.com/dashboard` and its subpaths (including locale prefixes like `/cn/dashboard`). Overlay rendering is limited to the Spending and Usage paths. The dashboard is a client-side app: the script hooks `pushState` / `replaceState` so switching tabs injects without a full reload.
 
-Version lives in the script header as `@version 20260820.8` (`YYYYMMDD.N`, reset `.N` each calendar day).
+Version lives in the script header as `@version 20260826.7` (`YYYYMMDD.N`, reset `.N` each calendar day).
 
 ## What you will see
 
@@ -41,26 +41,26 @@ Quota line (only when data exists):
 
 | Block | Meaning |
 | --- | --- |
-| Cursor Models | Dollars spent / cap. Uses `auto_limit` when the JSON includes it; otherwise **infers** `spent ÷ percent` and labels it `inferred` |
-| Other Models | Included usage / included cap (`api_limit` first, else `includedAmountCents`) |
-| Grok Bot | This week’s `sand-*` spend ÷ weekly percent; also labeled `inferred` |
-| top … | Highest-spend model in that pool |
+| Cursor Models | Dollars spent / cap. Uses `auto_limit` when the JSON includes it; otherwise **infers** `spent ÷ percent` and labels it `inferred`. After the 2026-08-24 included-usage bump this Ultra account infers **$3000** (was **$2000** on 2026-08-20) |
+| Other Models | Same inference as Cursor Models: list-price event spend ÷ `apiPercentUsed`. Not a published dollar cap; the snapshot can move when those two meters disagree |
+| Grok Bot | This week’s `sand-*` spend ÷ weekly percent; also inferred with the same snapshot line |
+| top 1–3 | Highest-spend models in that pool, shown as chips under the quota line |
 
 The script does not rewrite Cursor’s own copy (reset dates stay in the page locale). Overlay strings are English.
 
-## How the Cursor Models cap is inferred
+## How caps are inferred
 
-`PlanUsage` in the protobuf has `auto_limit` / `auto_spend`, but the HTTP JSON often omits them and only sends `autoPercentUsed`.
+`PlanUsage` in the protobuf has `auto_limit` / `api_limit`, but the HTTP JSON often omits them and only sends percentages.
 
 ```text
-cap ≈ Cursor Models spend this cycle ÷ (autoPercentUsed / 100)
+Cursor Models cap ≈ Cursor Models spend this cycle ÷ (autoPercentUsed / 100)
+Other Models cap  ≈ Other Models spend this cycle  ÷ (apiPercentUsed / 100)
+Grok weekly cap   ≈ sand-* spend this week         ÷ (usagePercent / 100)
 ```
 
-Spend is the sum of `totalCents` from `POST /api/dashboard/get-aggregated-usage-events`. Membership in the Cursor Models pool follows `autoBucketModels`, plus **family matching** after stripping version and quality suffixes (so `grok-4.6` still matches a list that says `grok-4.5`). `sand-*` belongs to Grok Bot, not this pool.
+Spend is the sum of `totalCents` from `POST /api/dashboard/get-aggregated-usage-events`. Membership in the Cursor Models pool follows `autoBucketModels`, plus **family matching** after stripping version and quality suffixes (so `grok-4.6` still matches a list that says `grok-4.5`). Everything else except `sand-*` is Other Models. `sand-*` belongs to Grok Bot, not these two pools.
 
-When the quotient is within 1.5% of a round dollar amount, the script snaps to that round figure so you can compare caps across days. That value is inferred, not an official field.
-
-The same spend÷percent trick does **not** apply to Other Models: list-price event cents and the included-usage percent often disagree. Other Models uses the official included cap only.
+When the quotient is within 1.5% of a round dollar amount, the script snaps to that round figure. The overlay also prints the raw snapshot (`list $X ÷ Y% = $Z`) so a moving Other Models cap can be checked against the inputs. Cursor does not currently publish a dollar denominator for that bar; `planUsage.limit` is a different included ledger and is not used.
 
 ## Privacy
 
