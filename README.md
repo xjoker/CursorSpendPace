@@ -22,9 +22,11 @@ The script runs in your logged-in `cursor.com` tab and reads the same origin API
 
 To install from this repo instead, create a new Tampermonkey script and paste [`cursor-spend-pace.user.js`](./cursor-spend-pace.user.js).
 
-`@match` covers `cursor.com/dashboard` and its subpaths (including locale prefixes like `/cn/dashboard`). Overlay rendering is limited to the Spending and Usage paths. The dashboard is a client-side app: the script hooks `pushState` / `replaceState` so switching tabs injects without a full reload.
+`@match` is `https://cursor.com/*` (and `www`) so the script is already running if you enter via `/agents` or other site pages and SPA-click into Spending. Overlay rendering is still limited to the Spending and Usage paths. The app is client-routed: the script hooks `pushState` / `replaceState` and does not need a full reload after a tab switch.
 
-Version lives in the script header as `@version 20260826.8` (`YYYYMMDD.N`, reset `.N` each calendar day).
+Version lives in the script header as `@version 20260901.5` (`YYYYMMDD.N`, reset `.N` each calendar day).
+
+On non-Spending/Usage pages the script stays idle: no `MutationObserver`, slow URL poll only, no API traffic. It arms when the URL (or a Spending/Usage click) targets the overlay pages.
 
 ## What you will see
 
@@ -41,9 +43,9 @@ Quota line (only when data exists):
 
 | Block | Meaning |
 | --- | --- |
-| Cursor Models | Dollars spent / cap. Uses `auto_limit` when the JSON includes it; otherwise **infers** `spent ÷ percent` and labels it `inferred`. After the 2026-08-24 included-usage bump this Ultra account infers **$3000** (was **$2000** on 2026-08-20) |
-| Other Models | Same inference as Cursor Models: list-price event spend ÷ `apiPercentUsed`. Not a published dollar cap; the snapshot can move when those two meters disagree |
-| Grok Bot | This week’s `sand-*` spend ÷ weekly percent; also inferred with the same snapshot line |
+| Cursor Models | Dollars spent / cap. Uses `auto_limit` when the JSON includes it; otherwise **infers** `spent ÷ percent` and labels it `inferred`. This Ultra account: **$2000** (2026-08-20) → **$3000** (2026-08-24) → **$3938** (2026-09-01 snapshot) |
+| Other Models | Same inference as Cursor Models: list-price event spend ÷ `apiPercentUsed`. Not a published dollar cap. At ~100% the overlay stops pretending the spend is the cap and shows a lower-bound note instead |
+| Grok Bot | This week’s `grok-bot-*` (legacy `sand-*`) spend ÷ weekly percent; also inferred with the same snapshot line |
 | top 1–3 | Highest-spend models in that pool, shown as chips under the quota line |
 
 The script does not rewrite Cursor’s own copy (reset dates stay in the page locale). Overlay strings are English.
@@ -55,18 +57,20 @@ The script does not rewrite Cursor’s own copy (reset dates stay in the page lo
 ```text
 Cursor Models cap ≈ Cursor Models spend this cycle ÷ (autoPercentUsed / 100)
 Other Models cap  ≈ Other Models spend this cycle  ÷ (apiPercentUsed / 100)
-Grok weekly cap   ≈ sand-* spend this week         ÷ (usagePercent / 100)
+Grok weekly cap   ≈ grok-bot-* spend this week     ÷ (usagePercent / 100)
 ```
 
-Spend is the sum of `totalCents` from `POST /api/dashboard/get-aggregated-usage-events`. Membership in the Cursor Models pool follows `autoBucketModels`, plus **family matching** after stripping version and quality suffixes (so `grok-4.6` still matches a list that says `grok-4.5`). Everything else except `sand-*` is Other Models. `sand-*` belongs to Grok Bot, not these two pools.
+Spend is the sum of `totalCents` from `POST /api/dashboard/get-aggregated-usage-events`. Membership in the Cursor Models pool follows `autoBucketModels`, plus **family matching** after stripping version and quality suffixes (so `grok-4.6` still matches a list that says `grok-4.5`). `grok-bot-*` and legacy `sand-*` belong to Grok Bot, not these two pools. Everything else is Other Models.
 
 When the quotient is within 1.5% of a round dollar amount, the script snaps to that round figure. The overlay also prints the raw snapshot (`list $X ÷ Y% = $Z`) so a moving Other Models cap can be checked against the inputs. Cursor does not currently publish a dollar denominator for that bar; `planUsage.limit` is a different included ledger and is not used.
+
+When a bar is already ~100%, spend÷percent collapses to spend and cannot recover the denominator. The script then looks up earlier same-window readings in `localStorage` (`cs-pace-meter-snaps-v1`, max 120 points, oldest dropped first) and labels the result `from history`. Until at least one sub-100% snapshot exists for that billing/week window, it only shows a lower bound.
 
 ## Privacy
 
 - `@grant none` — no extra Tampermonkey APIs
 - Fetches stay on `cursor.com` with your existing session cookie
-- Nothing is uploaded; the script does not write remote logs
+- Meter snapshots stay in the page’s `localStorage` on `cursor.com` (spend cents + percent + timestamp only); nothing is uploaded; the script does not write remote logs
 
 Do not commit screenshots that include the account sidebar. The cropped overlay shot in this README is the intended demo.
 

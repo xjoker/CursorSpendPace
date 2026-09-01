@@ -1,16 +1,12 @@
 // ==UserScript==
 // @name         Cursor Spend Pace
 // @namespace    https://github.com/xjoker/CursorSpendPace
-// @version      20260826.8
+// @version      20260901.5
 // @description  Linear-burn pace, high-precision usage, and inferred caps on the Cursor Spending dashboard
 // @author       chou
 // @license      MIT
-// @match        https://cursor.com/dashboard
-// @match        https://cursor.com/dashboard/*
-// @match        https://www.cursor.com/dashboard
-// @match        https://www.cursor.com/dashboard/*
-// @match        https://cursor.com/*/dashboard
-// @match        https://cursor.com/*/dashboard/*
+// @match        https://cursor.com/*
+// @match        https://www.cursor.com/*
 // @run-at       document-start
 // @grant        none
 // ==/UserScript==
@@ -30,6 +26,9 @@
   const META_CLASS = "cs-pace-meta";
   const STYLE_ID = "cs-pace-style";
   const JSON_HEADERS = { "content-type": "application/json" };
+  const SNAP_KEY = "cs-pace-meter-snaps-v1";
+  const SNAP_MAX = 120;
+  const SNAP_MIN_GAP_MS = 5 * 60 * 1000;
 
   let cachedSummary = null;
   let cachedPeriod = null;
@@ -43,9 +42,20 @@
   let waitUntil = 0;
   let applying = false;
   let pendingRender = false;
+  let refreshing = false;
+  let refreshQueued = false;
+  let expectOverlay = false;
   let observer = null;
   let lastHref = "";
+  let pageActive = false;
+  let observing = false;
+  let hrefPollTimer = 0;
+  let historyHookTimer = 0;
+  let moDebounceTimer = 0;
   const OBSERVE_OPTS = { childList: true, subtree: true };
+  const HREF_POLL_IDLE_MS = 2500;
+  const HREF_POLL_ACTIVE_MS = 1500;
+  const MO_DEBOUNCE_MS = 200;
 
   function dashboardPath() {
     return (location.pathname.replace(/\/+$/, "") || "/").replace(
@@ -54,7 +64,7 @@
     );
   }
 
-  function onOverlayPage() {
+  function isOverlayPath() {
     const path = dashboardPath();
     if (
       path === "/dashboard/spending" ||
@@ -65,11 +75,16 @@
       return true;
     }
     const tab = new URLSearchParams(location.search).get("tab");
-    if (path === "/dashboard" && /^(spending|usage)$/i.test(tab || "")) return true;
+    return path === "/dashboard" && /^(spending|usage)$/i.test(tab || "");
+  }
+
+  // URL-first. Avoid scanning the whole document on every poll/mutation.
+  function onOverlayPage() {
+    if (isOverlayPath()) return true;
+    const path = dashboardPath();
+    if (!path.startsWith("/dashboard")) return false;
     return Boolean(
-      document.querySelector("[id^='included-in-']") ||
-        document.getElementById("grok-bot") ||
-        includedSectionRoots().length > 0,
+      document.getElementById("grok-bot") || document.querySelector("[id^='included-in-']"),
     );
   }
 
@@ -373,7 +388,8 @@
       if (/^included-in-/i.test(el.id)) add(el);
     });
     document.querySelectorAll("h1,h2,h3,h4,button").forEach((el) => {
-      if (/^included in /i.test((el.textContent || "").trim())) add(el);
+      const text = (el.textContent || "").trim();
+      if (/^included in /i.test(text) || /^included usage\b/i.test(text)) add(el);
     });
     return roots;
   }
@@ -397,8 +413,14 @@
   }
 
   function cardText(track) {
+    let el = track;
+    for (let i = 0; i < 8 && el; i++) {
+      const text = el.textContent || "";
+      if (/Cursor Models|Other Models|Grok Bot|Weekly usage/i.test(text)) return text;
+      el = el.parentElement;
+    }
     const card = track.closest(".px-4.py-3") || track.parentElement;
-    return card?.innerText || "";
+    return card?.textContent || "";
   }
 
   function trackKind(track, fallbackIndex) {
@@ -419,8 +441,9 @@
     return Number(row?.totalCents ?? row?.total_cents ?? 0);
   }
 
-  function isSandModel(name) {
-    return /^sand(?:[-_]|$)/i.test(name || "");
+  function isGrokBotModel(name) {
+    const n = name || "";
+    return /^sand(?:[-_]|$)/i.test(n) || /^grok-bot(?:[-_]|$)/i.test(n);
   }
 
   function modelStem(name) {
@@ -442,7 +465,7 @@
   }
 
   function isCursorPoolModel(name, autoSet) {
-    if (!name || isSandModel(name)) return false;
+    if (!name || isGrokBotModel(name)) return false;
     if (autoSet.has(name)) return true;
     for (const bucket of autoSet) {
       if (sameModelFamily(name, bucket)) return true;
@@ -451,7 +474,7 @@
   }
 
   function isOtherPoolModel(name, autoSet) {
-    if (!name || isSandModel(name)) return false;
+    if (!name || isGrokBotModel(name)) return false;
     return !isCursorPoolModel(name, autoSet);
   }
 
@@ -465,16 +488,18 @@
   }
 
   function topSpenders(agg, predicate, limit = 3) {
-    const rows = [];
+    const byName = new Map();
     for (const row of agg?.aggregations || []) {
       const name = rowName(row);
       if (!predicate(name)) continue;
       const cents = rowCents(row);
       if (!(cents > 0)) continue;
-      rows.push({ name, cents });
+      byName.set(name, (byName.get(name) || 0) + cents);
     }
-    rows.sort((a, b) => b.cents - a.cents);
-    return rows.slice(0, limit);
+    return [...byName.entries()]
+      .map(([name, cents]) => ({ name, cents }))
+      .sort((a, b) => b.cents - a.cents)
+      .slice(0, limit);
   }
 
   function escapeText(value) {
@@ -518,8 +543,101 @@
     return Math.round(rawCents);
   }
 
-  function inferCap(usedCents, pct, label) {
+  function readMeterSnaps() {
+    try {
+      const raw = localStorage.getItem(SNAP_KEY);
+      if (!raw) return [];
+      const list = JSON.parse(raw);
+      return Array.isArray(list) ? list : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function writeMeterSnaps(list) {
+    try {
+      const pruned = list
+        .filter((s) => s && Number.isFinite(s.t) && s.pool && s.w)
+        .sort((a, b) => a.t - b.t);
+      while (pruned.length > SNAP_MAX) pruned.shift();
+      localStorage.setItem(SNAP_KEY, JSON.stringify(pruned));
+    } catch {
+      // QuotaExceeded or private mode — inference still works without history.
+    }
+  }
+
+  function pushMeterSnap(pool, windowKey, spendCents, pct) {
+    if (!pool || !windowKey) return;
+    if (!(Number.isFinite(spendCents) && spendCents > 0 && Number.isFinite(pct) && pct > 0)) return;
+    const now = Date.now();
+    const list = readMeterSnaps();
+    const last = [...list].reverse().find((s) => s.pool === pool && s.w === windowKey);
+    if (
+      last &&
+      now - last.t < SNAP_MIN_GAP_MS &&
+      Math.abs(last.c - spendCents) < 1 &&
+      Math.abs(last.p - pct) < 0.01
+    ) {
+      return;
+    }
+    list.push({
+      t: now,
+      pool,
+      w: windowKey,
+      c: Math.round(spendCents * 1000) / 1000,
+      p: Math.round(pct * 1e6) / 1e6,
+    });
+    writeMeterSnaps(list);
+  }
+
+  function formatSnapTime(ms) {
+    if (!Number.isFinite(ms)) return "n/a";
+    try {
+      return new Date(ms).toISOString().slice(0, 16).replace("T", " ") + "Z";
+    } catch {
+      return "n/a";
+    }
+  }
+
+  function inferCapFromHistory(pool, windowKey, usedCents, label) {
+    if (!pool || !windowKey || !(usedCents > 0)) return null;
+    const snaps = readMeterSnaps()
+      .filter(
+        (s) =>
+          s.pool === pool &&
+          s.w === windowKey &&
+          Number.isFinite(s.c) &&
+          s.c > 0 &&
+          Number.isFinite(s.p) &&
+          s.p > 0 &&
+          s.p < 99.5,
+      )
+      .sort((a, b) => b.t - a.t);
+    if (!snaps.length) return null;
+    // Prefer the freshest usable bar reading in this billing/week window.
+    const hit = snaps[0];
+    const raw = hit.c / (hit.p / 100);
+    const cap = inferRoundCapCents(raw);
+    if (cap == null) return null;
+    return {
+      line: `${formatUsdFromCents(usedCents)} / ${formatUsdFromCents(cap)} from history ${label}`,
+      note: `history ${formatSnapTime(hit.t)} list ${formatUsdFromCents(hit.c)} ÷ ${formatPct(hit.p, 3)} = ${formatUsdFromCents(raw)}; bar now ~100%`,
+    };
+  }
+
+  function inferCap(usedCents, pct, label, opts = {}) {
     if (!(Number.isFinite(pct) && pct > 0 && usedCents > 0)) return null;
+    const pool = opts.pool || "";
+    const windowKey = opts.windowKey || "";
+    // At ~100% the quotient collapses to spend; use an earlier same-window snapshot.
+    if (pct >= 99.5) {
+      return (
+        inferCapFromHistory(pool, windowKey, usedCents, label) || {
+          line: `${formatUsdFromCents(usedCents)} used · bar ${formatPct(pct, 2)} (${label} ≥ this)`,
+          note: `bar is ~100%, no earlier snapshot in localStorage for this window yet`,
+        }
+      );
+    }
     const raw = usedCents / (pct / 100);
     const cap = inferRoundCapCents(raw);
     if (cap == null) return null;
@@ -529,13 +647,47 @@
     };
   }
 
-  function cursorModelsQuotaLine(period, agg) {
+  function captureMeterSnaps(summary, period, agg, grok, grokAgg) {
+    const monthKey = monthWindowKey(summary, period);
+    if (monthKey && (summary || period) && agg) {
+      const autoSet = autoModelSet(period);
+      const usage = period?.planUsage || {};
+      const autoPct = pickNumber(usage, ["autoPercentUsed", "auto_percent_used"]);
+      const apiPct =
+        pickNumber(usage, ["apiPercentUsed", "api_percent_used"]) ??
+        pickNumber(summary?.individualUsage?.plan, ["apiPercentUsed", "api_percent_used"]);
+      const cursorCents = sumMatchingCents(agg, (name) => isCursorPoolModel(name, autoSet));
+      const otherCents = sumMatchingCents(agg, (name) => isOtherPoolModel(name, autoSet));
+      if (autoPct != null) pushMeterSnap("cursor", monthKey, cursorCents, autoPct);
+      if (apiPct != null) pushMeterSnap("other", monthKey, otherCents, apiPct);
+    }
+    if (grok && grokAgg) {
+      const gKey = grokWindowKey(grok);
+      const gPct = pickNumber(grok, ["usagePercent", "usage_percent"]);
+      const gCents = sumMatchingCents(grokAgg, isGrokBotModel);
+      if (gKey && gPct != null) pushMeterSnap("grok", gKey, gCents, gPct);
+    }
+  }
+
+  function monthWindowKey(summary, period) {
+    const start =
+      parseTime(summary?.billingCycleStart) || parseTime(period?.billingCycleStart);
+    return Number.isFinite(start) ? `m:${start}` : "";
+  }
+
+  function grokWindowKey(grok) {
+    const start = parseTime(grok?.currentPeriodStart || grok?.current_period_start);
+    return Number.isFinite(start) ? `g:${start}` : "";
+  }
+
+  function cursorModelsQuotaLine(period, agg, summary) {
     const autoSet = autoModelSet(period);
     const tops = topSpenders(agg, (name) => isCursorPoolModel(name, autoSet));
     const usage = period?.planUsage || {};
     const pct = pickNumber(usage, ["autoPercentUsed", "auto_percent_used"]);
     const protoLimit = pickNumber(usage, ["autoLimit", "auto_limit"], true);
     const protoSpend = pickNumber(usage, ["autoSpend", "auto_spend"]);
+    const windowKey = monthWindowKey(summary, period);
     let line = "Cursor Models cap omitted by API";
     let note = "";
     if (protoLimit != null) {
@@ -543,7 +695,10 @@
       line = `${formatUsdFromCents(used)} / ${formatUsdFromCents(protoLimit)} Cursor Models`;
     } else {
       const usedCents = sumMatchingCents(agg, (name) => isCursorPoolModel(name, autoSet));
-      const inferred = inferCap(usedCents, pct, "Cursor Models cap");
+      const inferred = inferCap(usedCents, pct, "Cursor Models cap", {
+        pool: "cursor",
+        windowKey,
+      });
       if (inferred) {
         line = inferred.line;
         note = inferred.note;
@@ -561,6 +716,7 @@
       pickNumber(summary?.individualUsage?.plan, ["apiPercentUsed", "api_percent_used"]);
     const protoLimit = pickNumber(usage, ["apiLimit", "api_limit"], true);
     const protoSpend = pickNumber(usage, ["apiSpend", "api_spend"]);
+    const windowKey = monthWindowKey(summary, period);
     let line = "Other Models cap omitted by API";
     let note = "";
     if (protoLimit != null) {
@@ -568,7 +724,10 @@
       line = `${formatUsdFromCents(used)} / ${formatUsdFromCents(protoLimit)} Other Models`;
     } else {
       const usedCents = sumMatchingCents(agg, (name) => isOtherPoolModel(name, autoSet));
-      const inferred = inferCap(usedCents, pct, "Other Models cap");
+      const inferred = inferCap(usedCents, pct, "Other Models cap", {
+        pool: "other",
+        windowKey,
+      });
       if (inferred) {
         line = inferred.line;
         note = inferred.note;
@@ -578,15 +737,18 @@
   }
 
   function grokQuotaLine(grok, grokAgg) {
-    const tops = topSpenders(grokAgg, isSandModel);
+    const tops = topSpenders(grokAgg, isGrokBotModel);
     const pct = pickNumber(grok, ["usagePercent", "usage_percent"]);
-    const usedCents = sumMatchingCents(grokAgg, isSandModel);
+    const usedCents = sumMatchingCents(grokAgg, isGrokBotModel);
     let line =
       grok?.hasNonZeroIncludedLimit || grok?.has_non_zero_included_limit
         ? "Grok included limit exists, cap omitted by API"
         : "Grok weekly cap omitted by API";
     let note = "";
-    const inferred = inferCap(usedCents, pct, "Grok weekly cap");
+    const inferred = inferCap(usedCents, pct, "Grok weekly cap", {
+      pool: "grok",
+      windowKey: grokWindowKey(grok),
+    });
     if (inferred) {
       line = inferred.line;
       note = inferred.note;
@@ -777,26 +939,6 @@
     return { startMs, endMs, windowMs: endMs - startMs };
   }
 
-  function overlayNode(node) {
-    if (!node) return false;
-    if (node.nodeType === 3) return overlayNode(node.parentElement);
-    if (node.nodeType !== 1) return false;
-    return Boolean(node.id === STYLE_ID || node.closest?.(`.${WRAP_CLASS}, .${META_CLASS}`));
-  }
-
-  function onlyOverlayMutations(mutations) {
-    return mutations.every((m) => {
-      if (!overlayNode(m.target)) return false;
-      for (const node of m.addedNodes) {
-        if (node.nodeType === 1 && !overlayNode(node)) return false;
-      }
-      for (const node of m.removedNodes) {
-        if (node.nodeType === 1 && !overlayNode(node)) return false;
-      }
-      return true;
-    });
-  }
-
   function requestRender() {
     if (applying) {
       pendingRender = true;
@@ -819,7 +961,7 @@
       if (cachedSummary || cachedPeriod) {
         const { startMs, endMs, windowMs } = cycleWindow(cachedSummary, cachedPeriod);
         const pace = pacePercent(startMs, endMs, now);
-        const cursorLine = cursorModelsQuotaLine(cachedPeriod, cachedAgg);
+        const cursorLine = cursorModelsQuotaLine(cachedPeriod, cachedAgg, cachedSummary);
         const otherLine = otherModelsQuotaLine(cachedPeriod, cachedSummary, cachedAgg);
         poolTracks().forEach((track, index) => {
           const kind = trackKind(track, index);
@@ -858,95 +1000,197 @@
   }
 
   async function refresh() {
-    if (!onOverlayPage()) return;
-    const tasks = [
-      loadSummary()
-        .then((data) => {
-          cachedSummary = data;
-        })
-        .catch((err) => swallow("usage-summary", err)),
-      loadPeriod()
-        .then((data) => {
-          cachedPeriod = data;
-        })
-        .catch((err) => swallow("period-usage", err)),
-      loadGrok()
-        .then((data) => {
-          cachedGrok = data;
-        })
-        .catch((err) => swallow("sand-usage", err)),
-      resolveTeamId()
-        .then((id) => {
-          cachedTeamId = id;
-        })
-        .catch(() => {
-          cachedTeamId = -1;
-        }),
-    ];
-    await Promise.all(tasks);
-
-    const month = cycleWindow(cachedSummary, cachedPeriod);
-    if (Number.isFinite(month.startMs) && Number.isFinite(month.endMs)) {
-      try {
-        cachedAgg = await loadAgg(month.startMs, month.endMs);
-      } catch (err) {
-        swallow("month-agg", err);
-      }
+    if (refreshing) {
+      refreshQueued = true;
+      return;
     }
-    if (cachedGrok) {
-      const grokStart = parseTime(cachedGrok.currentPeriodStart || cachedGrok.current_period_start);
-      const grokEnd = parseTime(
-        cachedGrok.nextResetTimestampUtc || cachedGrok.next_reset_timestamp_utc,
-      );
-      if (Number.isFinite(grokStart) && Number.isFinite(grokEnd)) {
+    if (!onOverlayPage() && !expectOverlay) return;
+    refreshing = true;
+    try {
+      const tasks = [
+        loadSummary()
+          .then((data) => {
+            cachedSummary = data;
+          })
+          .catch((err) => swallow("usage-summary", err)),
+        loadPeriod()
+          .then((data) => {
+            cachedPeriod = data;
+          })
+          .catch((err) => swallow("period-usage", err)),
+        loadGrok()
+          .then((data) => {
+            cachedGrok = data;
+          })
+          .catch((err) => swallow("sand-usage", err)),
+        resolveTeamId()
+          .then((id) => {
+            cachedTeamId = id;
+          })
+          .catch(() => {
+            cachedTeamId = -1;
+          }),
+      ];
+      await Promise.all(tasks);
+
+      const month = cycleWindow(cachedSummary, cachedPeriod);
+      if (Number.isFinite(month.startMs) && Number.isFinite(month.endMs)) {
         try {
-          cachedGrokAgg = await loadAgg(grokStart, grokEnd);
+          cachedAgg = await loadAgg(month.startMs, month.endMs);
         } catch (err) {
-          swallow("grok-agg", err);
+          swallow("month-agg", err);
         }
       }
+      if (cachedGrok) {
+        const grokStart = parseTime(cachedGrok.currentPeriodStart || cachedGrok.current_period_start);
+        const grokEnd = parseTime(
+          cachedGrok.nextResetTimestampUtc || cachedGrok.next_reset_timestamp_utc,
+        );
+        if (Number.isFinite(grokStart) && Number.isFinite(grokEnd)) {
+          try {
+            cachedGrokAgg = await loadAgg(grokStart, grokEnd);
+          } catch (err) {
+            swallow("grok-agg", err);
+          }
+        }
+      }
+      if (onOverlayPage()) expectOverlay = false;
+      captureMeterSnaps(cachedSummary, cachedPeriod, cachedAgg, cachedGrok, cachedGrokAgg);
+      render();
+      if (onOverlayPage() && !overlayHasTracks()) startWaitForBars(true);
+      syncPageMode();
+    } finally {
+      refreshing = false;
+      if (refreshQueued) {
+        refreshQueued = false;
+        scheduleFetch(true);
+      }
     }
-    render();
+  }
+
+  // Do not reset an already-pending fetch timer. Continuous SPA mutations used to
+  // keep pushing the 80ms debounce out until waitForBars expired, so nothing rendered.
+  function scheduleFetch(force = false) {
+    if (fetchTimer && !force) return;
+    window.clearTimeout(fetchTimer);
+    fetchTimer = window.setTimeout(() => {
+      fetchTimer = 0;
+      refresh();
+    }, force ? 50 : 120);
   }
 
   function schedule() {
-    window.clearTimeout(fetchTimer);
-    fetchTimer = window.setTimeout(() => {
-      refresh();
-    }, 80);
+    scheduleFetch(false);
   }
 
-  function startWaitForBars() {
+  function stopWaitForBars() {
+    window.clearTimeout(waitTimer);
+    waitTimer = 0;
+    waitUntil = 0;
+  }
+
+  function startWaitForBars(reset = false) {
     const now = Date.now();
-    if (!waitUntil || now >= waitUntil) waitUntil = now + 12_000;
+    if (reset || !waitUntil || now >= waitUntil) waitUntil = now + 20_000;
     if (waitTimer) return;
     tickWait();
   }
 
   function tickWait() {
     waitTimer = 0;
-    if (!onOverlayPage()) {
-      if (Date.now() < waitUntil) waitTimer = window.setTimeout(tickWait, 250);
+    if (!onOverlayPage() && !expectOverlay) {
+      stopWaitForBars();
+      syncPageMode();
       return;
     }
     if (overlayHasTracks()) {
       if (cachedSummary || cachedPeriod || cachedGrok) requestRender();
-      else schedule();
+      else scheduleFetch(false);
+      // One short follow-up in case SPA swaps the bars once; do not poll for 20s.
+      if (Date.now() < waitUntil) {
+        waitUntil = 0;
+        waitTimer = window.setTimeout(() => {
+          waitTimer = 0;
+          if (onOverlayPage() && overlayHasTracks()) {
+            if (cachedSummary || cachedPeriod || cachedGrok) requestRender();
+          } else if (onOverlayPage() || expectOverlay) {
+            startWaitForBars(true);
+          }
+        }, 800);
+      }
       return;
     }
-    if (Date.now() >= waitUntil) return;
-    if (cachedSummary || cachedPeriod || cachedGrok) requestRender();
-    else schedule();
-    waitTimer = window.setTimeout(tickWait, 250);
+    if (Date.now() >= waitUntil) {
+      waitUntil = 0;
+      syncPageMode();
+      return;
+    }
+    if (!(cachedSummary || cachedPeriod || cachedGrok) && !refreshing) scheduleFetch(false);
+    else if (cachedSummary || cachedPeriod || cachedGrok) requestRender();
+    waitTimer = window.setTimeout(tickWait, 300);
+  }
+
+  function startObserving() {
+    if (observing || !observer) return;
+    const root = document.documentElement;
+    if (!root) return;
+    observer.observe(root, OBSERVE_OPTS);
+    observing = true;
+  }
+
+  function stopObserving() {
+    if (!observing || !observer) return;
+    observer.disconnect();
+    observing = false;
+    window.clearTimeout(moDebounceTimer);
+    moDebounceTimer = 0;
+  }
+
+  function setHrefPoll(ms) {
+    window.clearInterval(hrefPollTimer);
+    hrefPollTimer = window.setInterval(() => onUrlChange(), ms);
+  }
+
+  function syncPageMode() {
+    const want = onOverlayPage() || expectOverlay;
+    if (want === pageActive) {
+      if (want) startObserving();
+      return;
+    }
+    pageActive = want;
+    if (want) {
+      startObserving();
+      setHrefPoll(HREF_POLL_ACTIVE_MS);
+    } else {
+      stopObserving();
+      stopWaitForBars();
+      window.clearTimeout(renderTimer);
+      renderTimer = 0;
+      setHrefPoll(HREF_POLL_IDLE_MS);
+    }
+  }
+
+  function markExpectOverlay() {
+    expectOverlay = true;
+    syncPageMode();
+    startWaitForBars(true);
+    scheduleFetch(true);
   }
 
   function onUrlChange(force = false) {
-    if (!force && location.href === lastHref) return;
+    if (!force && location.href === lastHref) {
+      syncPageMode();
+      return;
+    }
     lastHref = location.href;
     if (onOverlayPage()) {
-      schedule();
-      startWaitForBars();
+      expectOverlay = false;
+      syncPageMode();
+      scheduleFetch(true);
+      startWaitForBars(true);
+      return;
     }
+    if (!expectOverlay) syncPageMode();
   }
 
   function hookHistoryMethod(method) {
@@ -974,54 +1218,69 @@
     document.addEventListener(
       "click",
       (ev) => {
-        const el = ev.target?.closest?.("a,button,[role='tab'],[role='link']");
+        const el = ev.target?.closest?.("a,button,[role='tab'],[role='link'],[role='menuitem']");
         if (!el) return;
-        const blob = `${el.getAttribute("href") || ""} ${el.getAttribute("aria-label") || ""} ${el.textContent || ""}`;
-        if (!/spending|usage/i.test(blob)) return;
+        const href = el.getAttribute("href") || "";
+        const blob = `${href} ${el.getAttribute("aria-label") || ""} ${el.textContent || ""}`;
+        const toOverlay =
+          /\/(?:[a-z]{2}(?:-[A-Za-z]+)?\/)?dashboard\/(spending|usage)\b/i.test(href) ||
+          /(?:\?|&)tab=(spending|usage)\b/i.test(href) ||
+          /\b(spending|usage|支出|用量|花费)\b/i.test(blob);
+        if (!toOverlay) return;
+        markExpectOverlay();
         window.setTimeout(() => onUrlChange(true), 0);
-        window.setTimeout(() => onUrlChange(true), 300);
+        window.setTimeout(() => onUrlChange(true), 400);
+        window.setTimeout(() => onUrlChange(true), 1200);
       },
       true,
     );
-    window.setInterval(() => {
+    // Next.js may replace history methods; re-hook rarely, not every second.
+    historyHookTimer = window.setInterval(() => {
       hookHistoryMethod("pushState");
       hookHistoryMethod("replaceState");
-    }, 1000);
+    }, 10_000);
   }
 
-  observer = new MutationObserver((mutations) => {
+  function onDomActivity() {
+    if (!pageActive && !expectOverlay && !isOverlayPath()) return;
     onUrlChange();
-    if (!onOverlayPage()) return;
-    if (onlyOverlayMutations(mutations)) return;
+    if (!onOverlayPage() && !expectOverlay) {
+      syncPageMode();
+      return;
+    }
     if (applying) {
       pendingRender = true;
-      startWaitForBars();
       return;
     }
     if (cachedSummary || cachedGrok || cachedPeriod) requestRender();
-    else schedule();
+    else scheduleFetch(false);
     if (!overlayHasTracks()) startWaitForBars();
+  }
+
+  observer = new MutationObserver(() => {
+    // Debounce: ignore mutation lists; we only need "DOM changed" while active.
+    window.clearTimeout(moDebounceTimer);
+    moDebounceTimer = window.setTimeout(() => {
+      moDebounceTimer = 0;
+      onDomActivity();
+    }, MO_DEBOUNCE_MS);
   });
 
   hookSpaNavigation();
-  if (document.documentElement) {
-    observer.observe(document.documentElement, OBSERVE_OPTS);
-  } else {
-    document.addEventListener("DOMContentLoaded", () => {
-      observer.observe(document.documentElement, OBSERVE_OPTS);
-    });
-  }
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible" && onOverlayPage()) refresh();
+    if (document.visibilityState === "visible" && (onOverlayPage() || expectOverlay)) {
+      scheduleFetch(true);
+    }
   });
+  // Data refresh only while the overlay page is open and visible.
   window.setInterval(() => {
-    onUrlChange();
-    if (onOverlayPage() && document.visibilityState === "visible") refresh();
+    if (!pageActive || document.visibilityState !== "visible") return;
+    if (onOverlayPage() || expectOverlay) scheduleFetch(true);
   }, 60_000);
-  window.setInterval(() => onUrlChange(), 400);
 
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", () => onUrlChange(true));
   }
   onUrlChange(true);
+  syncPageMode();
 })();
